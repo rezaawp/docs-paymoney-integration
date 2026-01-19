@@ -67,6 +67,213 @@ if (!hash_equals($computedSignature, $signature)) {
 
 ---
 
+### 3. Example Code
+```php
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use App\Models\MerchantApp;
+
+class MockAppController extends Controller
+{
+    public function index()
+    {
+        $orders = DB::table('mock_orders')->orderBy('id', 'desc')->get();
+        return view('mock.checkout', compact('orders'));
+    }
+
+    public function initiatePayment(Request $request)
+    {
+        $amount = $request->amount;
+        $paymentMethod = $request->payment_method;
+
+        // 1. Create Mock Order
+        $orderId = DB::table('mock_orders')->insertGetId([
+            'amount' => $amount,
+            'status' => 'created',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        // 2. Get Credentials (For simulation, we pick the first merchant app or a specific one)
+        // In a real scenario, these would be in the .env of the Client App
+        $app = MerchantApp::first();
+
+        if (!$app) {
+            return back()->with('error', 'No Merchant App found to simulate connection.');
+        }
+
+        // 3. Call PayMoney API to Verify Client & Get Token
+        // URL is internal localhost for simulation
+        $baseUrl = "https://nana-provident-augustine.ngrok-free.dev";
+
+        $responseToken = Http::post("$baseUrl/api/deposit/verify-client", [
+            'client_id' => $app->client_id,
+            'client_secret' => $app->client_secret,
+        ]);
+
+        if (!$responseToken->successful()) {
+            return back()->with('error', 'Failed to get access token: ' . $responseToken->body());
+        }
+
+        $tokenData = $responseToken->json();
+        if ($tokenData['status'] !== 'success') {
+            return back()->with('error', 'Token error: ' . $tokenData['message']);
+        }
+
+        $accessToken = $tokenData['data']['access_token'];
+
+        // 4. Call PayMoney API to Initiate Transaction
+        $callbackUrl = "https://nana-provident-augustine.ngrok-free.dev/mock/callback"; // Route we will create
+
+        $responseTrans = Http::withHeaders([
+            'Authorization' => 'Bearer ' . $accessToken
+        ])->post("$baseUrl/api/deposit/transaction-info", [
+            'amount' => $amount,
+            'currency' => $request->currency,
+            'payment_method' => $paymentMethod,
+            'successUrl' => url('mock/success'),
+            'cancelUrl' => url('mock/cancel'),
+            'callbackUrl' => $callbackUrl,
+            'order_id' => $orderId, // Passing the order ID
+        ]);
+
+        if (!$responseTrans->successful()) {
+            return back()->with('error', 'Failed to initiate transaction: ' . $responseTrans->body());
+        }
+
+        $transData = $responseTrans->json();
+
+        // Update PayMoney Ref in Mock Order for tracking
+        // Note: We are using 'uuid' from response which now corresponds to grant_id if we updated DepositApiController correctly, or we can use grant_id from transaction_info
+
+        // Based on previous code: 
+        // return response()->json([ ... 'transaction_info' => $res ])
+        // $res contains 'data' => ['grant_id' => ...]
+
+        $grantId = $transData['transaction_info']['data']['grant_id'] ?? null;
+
+        DB::table('mock_orders')->where('id', $orderId)->update([
+            'paymoney_ref' => $grantId
+        ]);
+
+        // 5. Redirect User
+        return redirect($transData['checkout_url']);
+    }
+
+    public function handleCallback(Request $request)
+    {
+        // This simulates the Client App receiving the webhook
+        $paymoneyRef = $request->transaction_ref; // grant_id
+        $status = $request->status;
+
+        \Log::info("Mock App Callback Received", $request->all());
+
+        // 1. Verify Signature (Anti-Cheating)
+        $signature = $request->header('X-Signature');
+
+        // In a real app, this secret would be stored in .env or config
+        $app = MerchantApp::first();
+        $clientSecret = $app ? $app->client_secret : '';
+
+        if (!$signature) {
+            \Log::warning("Mock App Callback Signature Missing", $request->all());
+            return response()->json(['status' => 'error', 'message' => 'Missing Signature'], 403);
+        }
+
+        if ($signature) {
+            $computedSignature = hash_hmac('sha256', json_encode($request->all()), $clientSecret);
+            if (!hash_equals($computedSignature, $signature)) {
+                \Log::warning("Mock App Callback Signature Mismatch", [
+                    'received' => $signature,
+                    'computed' => $computedSignature
+                ]);
+                return response()->json(['status' => 'error', 'message' => 'Invalid Signature'], 403);
+            }
+        }
+
+        if ($paymoneyRef) {
+            $mockStatus = 'pending';
+            if ($status == 'success') {
+                $mockStatus = 'paid';
+            } elseif ($status == 'failed') {
+                $mockStatus = 'failed';
+            } elseif ($status == 'pending') {
+                $mockStatus = 'pending';
+            }
+
+            \Log::info("Mock App Callback Status: " . $mockStatus);
+            // $mockStatus = ($status == 'success') ? 'paid' : 'failed';
+            // $mockStatus = ($status == 'pending') ? 'pending' : 'failed';
+
+            // Idempotency: Check if order exists and current status
+            $order = DB::table('mock_orders')
+                ->where('paymoney_ref', $paymoneyRef)
+                ->first();
+
+            if ($order) {
+                if ($order->status === 'paid') {
+                    \Log::info("Mock App: Order {$paymoneyRef} already paid, skipping update.");
+                    return response()->json(['status' => 'already_processed']);
+                }
+
+                // Conditional update
+                DB::table('mock_orders')
+                    ->where('paymoney_ref', $paymoneyRef)
+                    ->where('status', '!=', 'paid')
+                    ->update([
+                        'status' => $mockStatus,
+                        'updated_at' => now()
+                    ]);
+            }
+        }
+
+        return response()->json(['status' => 'received']);
+    }
+
+    public function refundTransaction(Request $request)
+    {
+        $grantId = $request->grant_id;
+        $amount  = $request->amount;
+
+        // 1. Get Credentials
+        $app = MerchantApp::first();
+        if (!$app) {
+            return response()->json(['status' => 'error', 'message' => 'Merchant App not found'], 404);
+        }
+
+        // 2. Get Access Token
+        $baseUrl = "https://nana-provident-augustine.ngrok-free.dev";
+
+        $responseToken = Http::post("$baseUrl/api/deposit/verify-client", [
+            'client_id' => $app->client_id,
+            'client_secret' => $app->client_secret,
+        ]);
+
+        if (!$responseToken->successful()) {
+            return response()->json(['status' => 'error', 'message' => 'Failed to auth: ' . $responseToken->body()], 400);
+        }
+
+        $accessToken = $responseToken->json()['data']['access_token'];
+
+        // 3. Request Refund
+        $responseRefund = Http::withHeaders([
+            'Authorization' => 'Bearer ' . $accessToken
+        ])->post("$baseUrl/api/refund/transaction", [
+            'grant_id' => $grantId,
+            'amount' => $amount
+        ]);
+
+        return $responseRefund->json();
+    }
+}
+```
+
 ## Integration Guide
 
 To integrate your application with PayMoney, follow these steps:
